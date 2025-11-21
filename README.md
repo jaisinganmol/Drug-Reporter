@@ -79,7 +79,7 @@ streamlit run app.py
 
 The AI Agent page allows you to control the system using natural language instead of navigating through menus.
 
-![alt text](AI Agent.png) 
+![alt text](AI_Agent.png) 
 
 ### Example Commands
 
@@ -94,7 +94,7 @@ The AI Agent page allows you to control the system using natural language instea
 **Multi-step Workflows:**
 - "Create a high severity warning for Ibuprofen about packaging issues, send to Midwest and West regions, then check the delivery status"
 
-![alt text](Send Alerts.png)
+![alt text](Send_Alerts.png)
 
 ### How It Works
 
