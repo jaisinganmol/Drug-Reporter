@@ -1,4 +1,4 @@
-# Drug Transponder
+# Drug Reporter
 
 A multi-agent system for managing and distributing drug safety alerts to pharmacies with delivery tracking and acknowledgment management.
 
