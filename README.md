@@ -72,9 +72,14 @@ Interactive dashboard for:
 - Viewing delivery statistics
 - AI Agent for natural language commands
 
+![alt text](Dashboard.png)
+
+
 ## AI Agent
 
 The AI Agent page allows you to control the system using natural language instead of navigating through menus.
+
+![alt text](AI Agent.png)
 
 ### Example Commands
 
@@ -88,6 +93,8 @@ The AI Agent page allows you to control the system using natural language instea
 
 **Multi-step Workflows:**
 - "Create a high severity warning for Ibuprofen about packaging issues, send to Midwest and West regions, then check the delivery status"
+
+![alt text](Send Alerts.png)
 
 ### How It Works
 
