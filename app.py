@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import os
 import json
@@ -32,8 +31,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
-# Function to load default data
 def load_default_data():
     """Load default pharmacies and drug reports"""
     default_pharmacies = [
@@ -133,7 +130,6 @@ def load_default_data():
 
     return default_pharmacies, default_drug_reports
 
-
 # Initialize session state
 if 'pharmacies' not in st.session_state:
     default_pharmacies, default_drug_reports = load_default_data()
@@ -153,11 +149,9 @@ if 'targeted_agent' not in st.session_state:
 if 'delivery_receipts' not in st.session_state:
     st.session_state.delivery_receipts = []
 
-# Main app
 st.title("Drug Transponder System")
 st.markdown("Multi-Agent Drug Safety Alert Management")
 
-# Sidebar navigation (SINGLE SIDEBAR)
 with st.sidebar:
     st.header("Navigation")
     page = st.radio(
@@ -206,12 +200,12 @@ if page == "Dashboard":
     col1, col2 = st.columns(2)
 
     with col1:
-        st.write("**Default Pharmacies Loaded:**")
+        st.write("Default Pharmacies Loaded:")
         for pharm in st.session_state.pharmacies[:3]:
             st.write(f"- {pharm['name']} ({pharm['pharmacy_type']})")
 
     with col2:
-        st.write("**Default Drug Reports Loaded:**")
+        st.write("Default Drug Reports Loaded:")
         for report in st.session_state.drug_reports[:3]:
             st.write(f"- {report['drug_name']} ({report['severity']})")
 
@@ -406,16 +400,89 @@ elif page == "Track Deliveries":
             if isinstance(delivery, dict):
                 receipts_list.append(delivery)
 
+        st.subheader("All Deliveries")
         st.dataframe(receipts_list, use_container_width=True)
 
         st.divider()
 
-        status_filter = st.selectbox("Filter by Status", ["All", "Sent", "Acknowledged", "Failed"])
+        status_filter = st.selectbox("Filter by Status", ["All", "pending", "acknowledged", "failed"])
 
         if status_filter != "All":
-            filtered = [r for r in receipts_list if r.get('status') == status_filter.lower()]
+            filtered = [r for r in receipts_list if r.get('status') == status_filter]
             st.dataframe(filtered, use_container_width=True)
             st.write(f"Found {len(filtered)} deliveries with status: {status_filter}")
+        else:
+            filtered = receipts_list
+
+        st.divider()
+
+        st.subheader("Acknowledge Deliveries")
+
+        col1, col2 = st.columns(2)
+
+        # Fixed: Update by index for session state
+        with col1:
+            if st.button("Acknowledge All Pending", use_container_width=True, type="primary"):
+                from models.delivery_receipt import DeliveryReceipt
+                count = 0
+                updated_receipts = []
+                for delivery in st.session_state.delivery_receipts:
+                    if isinstance(delivery, dict) and delivery.get("status") == "pending":
+                        receipt = DeliveryReceipt.from_dict(delivery)
+                        receipt.mark_acknowledged()
+                        updated_receipts.append(receipt.to_dict())
+                        count += 1
+                    else:
+                        updated_receipts.append(delivery)
+                st.session_state.delivery_receipts = updated_receipts
+                if count > 0:
+                    st.success(f"Acknowledged {count} deliveries!")
+                    st.rerun()
+                else:
+                    st.info("No pending deliveries to acknowledge")
+
+        with col2:
+            if st.button("Refresh", use_container_width=True):
+                st.rerun()
+
+        st.divider()
+
+        st.subheader("Acknowledge Individual Delivery")
+
+        pending_deliveries = [r for r in filtered if r.get('status') == 'pending']
+
+        if pending_deliveries:
+            selected_delivery = st.selectbox(
+                "Select a pending delivery",
+                range(len(pending_deliveries)),
+                format_func=lambda i: f"{pending_deliveries[i]['pharmacy_name']} - {pending_deliveries[i]['drug_name']} (ID: {pending_deliveries[i]['id']})"
+            )
+
+            delivery_to_ack = pending_deliveries[selected_delivery]
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.write(f"Pharmacy: {delivery_to_ack['pharmacy_name']}")
+            with col2:
+                st.write(f"Drug: {delivery_to_ack['drug_name']}")
+            with col3:
+                st.write(f"Sent: {delivery_to_ack['sent_at'][:10]}")
+
+            # Fixed: Proper update by index for session state
+            if st.button("Acknowledge This Delivery", use_container_width=True):
+                from models.delivery_receipt import DeliveryReceipt
+                for i, delivery in enumerate(st.session_state.delivery_receipts):
+                    if isinstance(delivery, dict) and delivery['id'] == delivery_to_ack['id']:
+                        receipt = DeliveryReceipt.from_dict(delivery)
+                        receipt.mark_acknowledged()
+                        st.session_state.delivery_receipts[i] = receipt.to_dict()
+                        break
+                st.success(f"Acknowledged delivery {delivery_to_ack['id']}")
+                st.rerun()
+        else:
+            st.info("No pending deliveries to acknowledge individually")
+
     else:
         st.info("No deliveries to track. Send an alert to get started!")
 
@@ -482,15 +549,15 @@ elif page == "AI Agent":
 
     with st.expander("Example Commands"):
         st.markdown("""
-        **Creating and Sending Alerts:**
+        Creating and Sending Alerts:
         - Create a critical recall for Metformin due to contamination and broadcast to all pharmacies
         - Send a targeted alert for Lisinopril to Northeast region only
 
-        **Checking Status:**
+        Checking Status:
         - Check delivery statistics
         - Send follow-up reminders to pharmacies that have not acknowledged
 
-        **Multi-step Workflows:**
+        Multi-step Workflows:
         - Create a high severity warning for Ibuprofen about packaging issues, send to Midwest and West regions, then check the delivery status
         """)
 
@@ -538,7 +605,7 @@ elif page == "AI Agent":
                                 tool_input = step[0].tool_input
                                 tool_output = step[1]
 
-                                st.markdown(f"**Step {i}: {tool_name}**")
+                                st.markdown(f"Step {i}: {tool_name}")
                                 st.code(f"Input: {tool_input}")
                                 st.code(f"Output: {tool_output[:500]}...")
                                 st.divider()
@@ -572,9 +639,8 @@ elif page == "AI Agent":
                 result = run_agent("Load sample pharmacies")
                 st.write(result["output"])
 
-# Footer
 st.divider()
 st.markdown("""
 ---
-**Drug Reporter** 2024 | Multi-Agent Healthcare Safety System
+Drug Reporter 2025 | Multi-Agent Healthcare Safety System
 """)
