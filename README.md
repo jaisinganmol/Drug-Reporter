@@ -64,7 +64,7 @@ Processes all drug reports automatically, routing to appropriate agents.
 streamlit run app.py
 ```
 
-Interactive dashboard for:
+###  Interactive dashboard for:
 - Viewing and creating drug reports
 - Adding pharmacies
 - Sending alerts (broadcast or targeted)
@@ -72,14 +72,14 @@ Interactive dashboard for:
 - Viewing delivery statistics
 - AI Agent for natural language commands
 
-![alt text](Dashboard.png)
+![alt text](Dashboard.png) 
 
 
 ## AI Agent
 
 The AI Agent page allows you to control the system using natural language instead of navigating through menus.
 
-![alt text](AI Agent.png)
+![alt text](AI Agent.png) 
 
 ### Example Commands
 
