@@ -2,6 +2,7 @@
 import streamlit as st
 import os
 import json
+from langchain_agent import run as run_agent
 from dotenv import load_dotenv
 from datetime import datetime
 from agents import AgentFactory
@@ -25,8 +26,8 @@ if not API_KEY:
 
 # Page config
 st.set_page_config(
-    page_title="Drug Reporter",
-    page_icon="💊",
+    page_title="Drug Transponder",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -139,7 +140,6 @@ if 'pharmacies' not in st.session_state:
     st.session_state.pharmacies = default_pharmacies
     st.session_state.drug_reports = default_drug_reports
 else:
-    # Ensure drug_reports exists
     if 'drug_reports' not in st.session_state:
         _, default_drug_reports = load_default_data()
         st.session_state.drug_reports = default_drug_reports
@@ -154,10 +154,10 @@ if 'delivery_receipts' not in st.session_state:
     st.session_state.delivery_receipts = []
 
 # Main app
-st.title("Drug Reporter System")
+st.title("Drug Transponder System")
 st.markdown("Multi-Agent Drug Safety Alert Management")
 
-# Sidebar navigation
+# Sidebar navigation (SINGLE SIDEBAR)
 with st.sidebar:
     st.header("Navigation")
     page = st.radio(
@@ -168,7 +168,8 @@ with st.sidebar:
             "Manage Pharmacies",
             "Send Alerts",
             "Track Deliveries",
-            "Statistics"
+            "Statistics",
+            "AI Agent"
         ]
     )
 
@@ -201,23 +202,21 @@ if page == "Dashboard":
 
     st.divider()
 
-    # System Info
     st.subheader("System Information")
     col1, col2 = st.columns(2)
 
     with col1:
         st.write("**Default Pharmacies Loaded:**")
         for pharm in st.session_state.pharmacies[:3]:
-            st.write(f"• {pharm['name']} ({pharm['pharmacy_type']})")
+            st.write(f"- {pharm['name']} ({pharm['pharmacy_type']})")
 
     with col2:
         st.write("**Default Drug Reports Loaded:**")
         for report in st.session_state.drug_reports[:3]:
-            st.write(f"• {report['drug_name']} ({report['severity']})")
+            st.write(f"- {report['drug_name']} ({report['severity']})")
 
     st.divider()
 
-    # Recent deliveries
     st.subheader("Recent Deliveries")
     if st.session_state.delivery_receipts:
         receipts_df = st.session_state.delivery_receipts[-10:]
@@ -333,8 +332,7 @@ elif page == "Send Alerts":
         drug_report_idx = st.selectbox(
             "Select Drug Report",
             range(len(st.session_state.drug_reports)),
-            format_func=lambda
-                i: f"{st.session_state.drug_reports[i]['drug_name']} ({st.session_state.drug_reports[i]['severity']})"
+            format_func=lambda i: f"{st.session_state.drug_reports[i]['drug_name']} ({st.session_state.drug_reports[i]['severity']})"
         )
 
         drug_report = st.session_state.drug_reports[drug_report_idx]
@@ -353,7 +351,7 @@ elif page == "Send Alerts":
                     st.success("Broadcast alerts sent!")
                     st.json(create_alert_summary(drug_report, results))
 
-        else:  # Targeted
+        else:
             col1, col2 = st.columns(2)
 
             available_regions = list(set([p['region'] for p in st.session_state.pharmacies]))
@@ -403,7 +401,6 @@ elif page == "Track Deliveries":
     st.header("Track Deliveries")
 
     if st.session_state.delivery_receipts:
-        # Convert to list of dicts for display
         receipts_list = []
         for delivery in st.session_state.delivery_receipts:
             if isinstance(delivery, dict):
@@ -413,7 +410,6 @@ elif page == "Track Deliveries":
 
         st.divider()
 
-        # Filter by status
         status_filter = st.selectbox("Filter by Status", ["All", "Sent", "Acknowledged", "Failed"])
 
         if status_filter != "All":
@@ -447,7 +443,6 @@ elif page == "Statistics":
 
         st.divider()
 
-        # Pie chart
         col1, col2 = st.columns(2)
 
         with col1:
@@ -474,9 +469,112 @@ elif page == "Statistics":
     else:
         st.info("No delivery data available yet. Send some alerts to see statistics!")
 
+# AI Agent Page
+elif page == "AI Agent":
+    st.header("AI Agent")
+    st.markdown("Use natural language to manage drug safety alerts")
+
+    user_command = st.text_area(
+        "What would you like to do?",
+        placeholder="e.g., Create a high severity recall for Aspirin and broadcast to all pharmacies",
+        height=100
+    )
+
+    with st.expander("Example Commands"):
+        st.markdown("""
+        **Creating and Sending Alerts:**
+        - Create a critical recall for Metformin due to contamination and broadcast to all pharmacies
+        - Send a targeted alert for Lisinopril to Northeast region only
+
+        **Checking Status:**
+        - Check delivery statistics
+        - Send follow-up reminders to pharmacies that have not acknowledged
+
+        **Multi-step Workflows:**
+        - Create a high severity warning for Ibuprofen about packaging issues, send to Midwest and West regions, then check the delivery status
+        """)
+
+    col1, col2 = st.columns([1, 4])
+
+    with col1:
+        run_button = st.button("Run", type="primary", use_container_width=True)
+
+    with col2:
+        verbose = st.checkbox("Show detailed steps", value=False)
+
+    if run_button:
+        if user_command.strip():
+            with st.spinner("Agent is working..."):
+                try:
+                    import langchain_tools
+
+                    langchain_tools.pharmacies = st.session_state.pharmacies
+                    langchain_tools.drug_reports = {
+                        r['id']: r for r in st.session_state.drug_reports
+                    }
+
+                    result = run_agent(user_command)
+
+                    for rid, report in langchain_tools.drug_reports.items():
+                        if not any(r['id'] == rid for r in st.session_state.drug_reports):
+                            st.session_state.drug_reports.append(report)
+
+                    new_receipts = (
+                        langchain_tools.broadcast_agent.delivery_receipts +
+                        langchain_tools.targeted_agent.delivery_receipts
+                    )
+                    for receipt in new_receipts:
+                        if receipt not in st.session_state.delivery_receipts:
+                            st.session_state.delivery_receipts.append(receipt)
+
+                    st.success("Completed!")
+                    st.subheader("Result")
+                    st.write(result["output"])
+
+                    if verbose and "intermediate_steps" in result:
+                        with st.expander("Tools Used", expanded=True):
+                            for i, step in enumerate(result["intermediate_steps"], 1):
+                                tool_name = step[0].tool
+                                tool_input = step[0].tool_input
+                                tool_output = step[1]
+
+                                st.markdown(f"**Step {i}: {tool_name}**")
+                                st.code(f"Input: {tool_input}")
+                                st.code(f"Output: {tool_output[:500]}...")
+                                st.divider()
+
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    st.exception(e)
+        else:
+            st.warning("Please enter a command")
+
+    st.divider()
+    st.subheader("Quick Actions")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if st.button("Check Statistics", use_container_width=True):
+            with st.spinner("Checking..."):
+                result = run_agent("Check delivery statistics")
+                st.write(result["output"])
+
+    with col2:
+        if st.button("Send Reminders", use_container_width=True):
+            with st.spinner("Sending..."):
+                result = run_agent("Send follow-up reminders")
+                st.write(result["output"])
+
+    with col3:
+        if st.button("Load Pharmacies", use_container_width=True):
+            with st.spinner("Loading..."):
+                result = run_agent("Load sample pharmacies")
+                st.write(result["output"])
+
 # Footer
 st.divider()
 st.markdown("""
 ---
-**Drug Reporter** © 2024 | Multi-Agent Healthcare Safety System
+**Drug Reporter** 2024 | Multi-Agent Healthcare Safety System
 """)
