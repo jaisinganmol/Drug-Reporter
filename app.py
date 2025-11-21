@@ -1,397 +1,482 @@
+# app.py
 import streamlit as st
-import anthropic
-import json
-from datetime import datetime, timedelta
-from enum import Enum
-import time
 import os
+import json
 from dotenv import load_dotenv
+from datetime import datetime
+from agents import AgentFactory
+from models import DrugReport, Pharmacy
+from utils import (
+    generate_id,
+    validate_email,
+    validate_phone,
+    create_alert_summary,
+    calculate_acknowledgment_rate,
+    get_severity_color
+)
 
+# Load environment variables
 load_dotenv()
-client = anthropic.Anthropic()
+API_KEY = os.getenv('ANTHROPIC_API_KEY')
 
-# --- Delivery Receipt Manager ---
-class DeliveryStatus(Enum):
-    PENDING = "pending"
-    DELIVERED = "delivered"
-    ACKNOWLEDGED = "acknowledged"
-    FAILED = "failed"
-    EXPIRED = "expired"
+if not API_KEY:
+    st.error("ANTHROPIC_API_KEY not found in .env file")
+    st.stop()
+
+# Page config
+st.set_page_config(
+    page_title="Drug Reporter",
+    page_icon="💊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 
-class DeliveryReceiptManager:
-    def __init__(self, acknowledgment_timeout_hours: int = 24):
-        self.delivery_log: dict[str, list[dict]] = {}
-        self.acknowledgment_timeout = timedelta(hours=acknowledgment_timeout_hours)
-
-    def store_receipt(self, report_id: str, pharmacy_ids: list[str],
-                      status: DeliveryStatus = DeliveryStatus.DELIVERED, metadata: dict = None) -> list[dict]:
-        ts = datetime.now()
-        created = []
-        for pid in pharmacy_ids:
-            existing = self._find_receipt(report_id, pid)
-            if existing:
-                existing["delivery_status"] = status.value
-                existing["last_updated"] = ts.isoformat()
-                existing["delivery_attempts"] = existing.get("delivery_attempts", 1) + 1
-                created.append(existing)
-                continue
-            record = {
-                "pharmacy_id": pid, "report": report_id,
-                "delivery_timestamp": ts.isoformat(), "delivery_status": status.value,
-                "acknowledgment_timestamp": None, "acknowledged_by": None,
-                "delivery_attempts": 1, "last_updated": ts.isoformat(),
-                "expires_at": (ts + self.acknowledgment_timeout).isoformat(),
-                "metadata": metadata or {}
-            }
-            self.delivery_log.setdefault(report_id, []).append(record)
-            created.append(record)
-        return created
-
-    def mark_acknowledged(self, report_id: str, pharmacy_id: str,
-                          acknowledged_by: str = None, notes: str = None) -> dict:
-        record = self._find_receipt(report_id, pharmacy_id)
-        if not record:
-            return None
-        ts = datetime.now().isoformat()
-        record.update({
-            "acknowledgment_timestamp": ts, "delivery_status": DeliveryStatus.ACKNOWLEDGED.value,
-            "acknowledged_by": acknowledged_by, "last_updated": ts
-        })
-        if notes:
-            record["metadata"]["acknowledgment_notes"] = notes
-        return record
-
-    def mark_failed(self, report_id: str, pharmacy_id: str, reason: str = None) -> dict:
-        record = self._find_receipt(report_id, pharmacy_id)
-        if not record:
-            return None
-        record["delivery_status"] = DeliveryStatus.FAILED.value
-        record["last_updated"] = datetime.now().isoformat()
-        if reason:
-            record["metadata"]["failure_reason"] = reason
-        return record
-
-    def get_acknowledgment_status(self, report_id: str) -> dict:
-        entries = self.delivery_log.get(report_id, [])
-        ack = [e for e in entries if e["acknowledgment_timestamp"]]
-        pending = [e for e in entries if not e["acknowledgment_timestamp"]
-                   and e["delivery_status"] != DeliveryStatus.FAILED.value]
-        failed = [e for e in entries if e["delivery_status"] == DeliveryStatus.FAILED.value]
-        return {
-            "report_id": report_id, "total_sent": len(entries),
-            "acknowledged_count": len(ack), "pending_count": len(pending), "failed_count": len(failed),
-            "acknowledgment_rate": len(ack) / len(entries) if entries else 0,
-            "acknowledged": [e["pharmacy_id"] for e in ack],
-            "pending": [e["pharmacy_id"] for e in pending],
-            "failed": [e["pharmacy_id"] for e in failed],
-            "details": entries
+# Function to load default data
+def load_default_data():
+    """Load default pharmacies and drug reports"""
+    default_pharmacies = [
+        {
+            'id': 'PHARM-NYC001',
+            'name': 'Downtown Pharmacy NYC',
+            'location': 'New York',
+            'phone': '555-0001',
+            'email': 'downtown@pharmacy.com',
+            'pharmacy_type': 'Independent',
+            'region': 'Northeast',
+            'created_at': datetime.now().isoformat()
+        },
+        {
+            'id': 'PHARM-NYC002',
+            'name': 'Main Street Pharmacy',
+            'location': 'New York',
+            'phone': '555-0002',
+            'email': 'mainst@pharmacy.com',
+            'pharmacy_type': 'Chain',
+            'region': 'Northeast',
+            'created_at': datetime.now().isoformat()
+        },
+        {
+            'id': 'PHARM-LA001',
+            'name': 'West Side Pharmacy',
+            'location': 'Los Angeles',
+            'phone': '555-0003',
+            'email': 'westside@pharmacy.com',
+            'pharmacy_type': 'Independent',
+            'region': 'West',
+            'created_at': datetime.now().isoformat()
+        },
+        {
+            'id': 'PHARM-CHI001',
+            'name': 'Central Pharmacy',
+            'location': 'Chicago',
+            'phone': '555-0004',
+            'email': 'central@pharmacy.com',
+            'pharmacy_type': 'Chain',
+            'region': 'Midwest',
+            'created_at': datetime.now().isoformat()
+        },
+        {
+            'id': 'PHARM-MIA001',
+            'name': 'Sunrise Hospital Pharmacy',
+            'location': 'Miami',
+            'phone': '555-0005',
+            'email': 'sunrise@pharmacy.com',
+            'pharmacy_type': 'Hospital',
+            'region': 'Southeast',
+            'created_at': datetime.now().isoformat()
         }
+    ]
 
-    def get_followup_candidates(self, report_id: str) -> list[dict]:
-        entries = self.delivery_log.get(report_id, [])
-        now = datetime.now()
-        return [
-            {**e, "is_expired": now > datetime.fromisoformat(e["expires_at"])}
-            for e in entries
-            if not e["acknowledgment_timestamp"] and e["delivery_status"] != DeliveryStatus.FAILED.value
+    default_drug_reports = [
+        {
+            'id': 'DRUG-001',
+            'drug_name': 'Metformin XR 500mg',
+            'alert_type': 'Safety Warning',
+            'severity': 'High',
+            'description': 'Potential contamination detected in batch numbers 12345-12500. Affected batches may contain glass particles.',
+            'action_required': 'Immediately notify all patients. Recall all affected batches. Check inventory against batch numbers.',
+            'created_at': datetime.now().isoformat(),
+            'created_by': 'FDA Safety Team',
+            'manufacturer': 'Pharma Corp Inc.',
+            'affected_batches': ['12345-12500'],
+            'regions_affected': ['Northeast', 'Midwest']
+        },
+        {
+            'id': 'DRUG-002',
+            'drug_name': 'Lisinopril 10mg',
+            'alert_type': 'Recall',
+            'severity': 'Critical',
+            'description': 'Manufacturing defect found in tablets. Some tablets may not contain the correct amount of active ingredient.',
+            'action_required': 'Stop dispensing immediately. Contact all patients who received this medication. Report to poison control.',
+            'created_at': datetime.now().isoformat(),
+            'created_by': 'FDA Safety Team',
+            'manufacturer': 'Generic Meds Ltd',
+            'affected_batches': ['LIS-2024-001', 'LIS-2024-002'],
+            'regions_affected': ['West', 'Southwest']
+        },
+        {
+            'id': 'DRUG-003',
+            'drug_name': 'Atorvastatin 20mg',
+            'alert_type': 'Contraindication',
+            'severity': 'Medium',
+            'description': 'New drug interaction discovered with common over-the-counter pain relievers.',
+            'action_required': 'Review patient medication lists. Counsel patients to avoid NSAIDs. Consider alternative statins if needed.',
+            'created_at': datetime.now().isoformat(),
+            'created_by': 'FDA Safety Team',
+            'manufacturer': 'Cardio Pharma',
+            'affected_batches': [],
+            'regions_affected': ['All']
+        }
+    ]
+
+    return default_pharmacies, default_drug_reports
+
+
+# Initialize session state
+if 'pharmacies' not in st.session_state:
+    default_pharmacies, default_drug_reports = load_default_data()
+    st.session_state.pharmacies = default_pharmacies
+    st.session_state.drug_reports = default_drug_reports
+else:
+    # Ensure drug_reports exists
+    if 'drug_reports' not in st.session_state:
+        _, default_drug_reports = load_default_data()
+        st.session_state.drug_reports = default_drug_reports
+
+if 'broadcast_agent' not in st.session_state:
+    st.session_state.broadcast_agent = AgentFactory.create_agent('broadcast', API_KEY)
+
+if 'targeted_agent' not in st.session_state:
+    st.session_state.targeted_agent = AgentFactory.create_agent('targeted', API_KEY)
+
+if 'delivery_receipts' not in st.session_state:
+    st.session_state.delivery_receipts = []
+
+# Main app
+st.title("Drug Reporter System")
+st.markdown("Multi-Agent Drug Safety Alert Management")
+
+# Sidebar navigation
+with st.sidebar:
+    st.header("Navigation")
+    page = st.radio(
+        "Select a page:",
+        [
+            "Dashboard",
+            "Create Drug Report",
+            "Manage Pharmacies",
+            "Send Alerts",
+            "Track Deliveries",
+            "Statistics"
         ]
+    )
 
-    def get_statistics(self) -> dict:
-        total_sent = total_ack = total_pending = total_failed = 0
-        for entries in self.delivery_log.values():
-            total_sent += len(entries)
-            total_ack += sum(1 for e in entries if e["acknowledgment_timestamp"])
-            total_pending += sum(1 for e in entries if not e["acknowledgment_timestamp"]
-                                 and e["delivery_status"] != DeliveryStatus.FAILED.value)
-            total_failed += sum(1 for e in entries if e["delivery_status"] == DeliveryStatus.FAILED.value)
-        return {
-            "total_reports": len(self.delivery_log), "total_sent": total_sent,
-            "total_acknowledged": total_ack, "total_pending": total_pending, "total_failed": total_failed,
-            "overall_rate": total_ack / total_sent if total_sent else 0
-        }
+    st.divider()
+    st.subheader("Quick Stats")
+    st.metric("Pharmacies", len(st.session_state.pharmacies))
+    st.metric("Drug Reports", len(st.session_state.drug_reports))
+    st.metric("Total Deliveries", len(st.session_state.delivery_receipts))
 
-    def _find_receipt(self, report_id: str, pharmacy_id: str) -> dict:
-        return next((e for e in self.delivery_log.get(report_id, []) if e["pharmacy_id"] == pharmacy_id), None)
+# Dashboard Page
+if page == "Dashboard":
+    st.header("Dashboard")
 
+    col1, col2, col3, col4 = st.columns(4)
 
-# --- Data Management ---
-class DrugReportManager:
-    def __init__(self):
-        self.reports = [
-            {"id": "drug_report_001", "drug_name": "Amoxicillin", "batch_number": "AMX-2024-001",
-             "severity": "critical", "issue": "Contamination detected - glass particles found",
-             "affected_pharmacies": ["all"], "timestamp": datetime.now().isoformat(),
-             "action_required": "Immediate recall - remove from shelves"},
-            {"id": "drug_report_002", "drug_name": "Lisinopril", "batch_number": "LIS-2024-045",
-             "severity": "warning", "issue": "Packaging defect - expiration date unclear",
-             "affected_pharmacies": ["pharmacy_005", "pharmacy_012"], "timestamp": datetime.now().isoformat(),
-             "action_required": "Inspect packaging, replace if needed"},
-            {"id": "drug_report_003", "drug_name": "Metformin", "batch_number": "MET-2024-089",
-             "severity": "info", "issue": "Supplier change notification",
-             "affected_pharmacies": ["pharmacy_003"], "timestamp": datetime.now().isoformat(),
-             "action_required": "Update supplier records"}
-        ]
-        self.pharmacies = {
-            "pharmacy_001": {"name": "Downtown Pharmacy", "email": "contact@downtown-pharm.com"},
-            "pharmacy_003": {"name": "Central Medical", "email": "alerts@central-med.com"},
-            "pharmacy_005": {"name": "Health Plus", "email": "support@healthplus-pharm.com"},
-            "pharmacy_012": {"name": "Wellness Center", "email": "ops@wellness-center.com"},
-        }
+    with col1:
+        st.metric("Total Pharmacies", len(st.session_state.pharmacies))
 
-    def get_drug_reports(self): return self.reports
+    with col2:
+        st.metric("Drug Reports", len(st.session_state.drug_reports))
 
-    def get_report_details(self, report_id: str):
-        return next((r for r in self.reports if r["id"] == report_id), None)
+    with col3:
+        total_receipts = len(st.session_state.delivery_receipts)
+        st.metric("Total Deliveries", total_receipts)
 
-    def get_all_pharmacies(self):
-        return [{"id": k, **v} for k, v in self.pharmacies.items()]
+    with col4:
+        acknowledged = len([r for r in st.session_state.delivery_receipts
+                            if r.get('status') == 'acknowledged'])
+        st.metric("Acknowledged", acknowledged)
 
-    def get_all_pharmacy_ids(self):
-        return list(self.pharmacies.keys())
+    st.divider()
 
+    # System Info
+    st.subheader("System Information")
+    col1, col2 = st.columns(2)
 
-class PharmacyNotificationService:
-    def __init__(self, receipt_manager: DeliveryReceiptManager):
-        self.receipt_manager = receipt_manager
+    with col1:
+        st.write("**Default Pharmacies Loaded:**")
+        for pharm in st.session_state.pharmacies[:3]:
+            st.write(f"• {pharm['name']} ({pharm['pharmacy_type']})")
 
-    def send_broadcast_alert(self, drug_report: dict, pharmacy_ids: list[str]) -> dict:
-        self.receipt_manager.store_receipt(
-            drug_report["id"], pharmacy_ids,
-            metadata={"alert_type": "broadcast", "severity": drug_report["severity"]}
-        )
-        return {"status": "broadcast_sent", "drug": drug_report["drug_name"],
-                "pharmacies_notified": len(pharmacy_ids), "timestamp": datetime.now().isoformat()}
+    with col2:
+        st.write("**Default Drug Reports Loaded:**")
+        for report in st.session_state.drug_reports[:3]:
+            st.write(f"• {report['drug_name']} ({report['severity']})")
 
-    def send_targeted_alert(self, pharmacy_ids: list[str], drug_report: dict) -> dict:
-        self.receipt_manager.store_receipt(
-            drug_report["id"], pharmacy_ids,
-            metadata={"alert_type": "targeted", "severity": drug_report["severity"]}
-        )
-        return {"status": "targeted_sent", "drug": drug_report["drug_name"],
-                "pharmacies_notified": pharmacy_ids, "timestamp": datetime.now().isoformat()}
+    st.divider()
 
-
-# --- Tools ---
-broadcast_tools = [
-    {"name": "get_report_details", "description": "Gets drug report details",
-     "input_schema": {"type": "object", "properties": {"report_id": {"type": "string"}}, "required": ["report_id"]}},
-    {"name": "broadcast_to_all_pharmacies", "description": "Broadcasts alert to ALL pharmacies",
-     "input_schema": {"type": "object",
-                      "properties": {"report_id": {"type": "string"}, "alert_message": {"type": "string"}},
-                      "required": ["report_id", "alert_message"]}}
-]
-
-targeted_tools = [
-    {"name": "get_report_details", "description": "Gets drug report details",
-     "input_schema": {"type": "object", "properties": {"report_id": {"type": "string"}}, "required": ["report_id"]}},
-    {"name": "alert_specific_pharmacies", "description": "Sends alert to specific pharmacies",
-     "input_schema": {"type": "object", "properties": {"report_id": {"type": "string"},
-                                                       "pharmacy_ids": {"type": "array", "items": {"type": "string"}},
-                                                       "alert_message": {"type": "string"}},
-                      "required": ["report_id", "pharmacy_ids", "alert_message"]}}
-]
-
-def process_tool(tool_name, tool_input, drug_mgr, notif_service, all_reports, all_pharmacy_ids):
-    report = drug_mgr.get_report_details(tool_input.get("report_id", ""))
-    if not report:
-        report = next((r for r in all_reports if r["id"] == tool_input.get("report_id")), None)
-    if tool_name == "get_report_details":
-        return json.dumps(report) if report else json.dumps({"error": "Not found"})
-    elif tool_name == "broadcast_to_all_pharmacies":
-        if report:
-            return json.dumps(notif_service.send_broadcast_alert(report, all_pharmacy_ids))
-        return json.dumps({"error": "Report not found"})
-    elif tool_name == "alert_specific_pharmacies":
-        if report:
-            return json.dumps(notif_service.send_targeted_alert(tool_input["pharmacy_ids"], report))
-        return json.dumps({"error": "Report not found"})
-    return json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-def run_agent(report_id, alert_type, pharmacy_ids, all_reports, receipt_mgr, all_pharmacy_ids):
-    drug_mgr = DrugReportManager()
-    notif_service = PharmacyNotificationService(receipt_mgr)
-
-    tools = broadcast_tools if alert_type == "broadcast" else targeted_tools
-    if alert_type == "broadcast":
-        prompt = f"Get details for report {report_id} and broadcast to all pharmacies."
+    # Recent deliveries
+    st.subheader("Recent Deliveries")
+    if st.session_state.delivery_receipts:
+        receipts_df = st.session_state.delivery_receipts[-10:]
+        st.dataframe(receipts_df, use_container_width=True)
     else:
-        prompt = f"Get details for report {report_id} and alert these pharmacies: {', '.join(pharmacy_ids)}"
+        st.info("No deliveries yet. Try sending an alert!")
 
-    messages = [{"role": "user", "content": prompt}]
-    execution_log = []
+# Create Drug Report Page
+elif page == "Create Drug Report":
+    st.header("Create Drug Report")
 
-    while True:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=1024, tools=tools, messages=messages)
+    with st.form("drug_report_form"):
+        col1, col2 = st.columns(2)
 
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if hasattr(block, 'text'):
-                    return block.text, execution_log, receipt_mgr.get_acknowledgment_status(report_id)
+        with col1:
+            drug_name = st.text_input("Drug Name", placeholder="e.g., Metformin XR 500mg")
+            alert_type = st.selectbox("Alert Type", ["Recall", "Safety Warning", "Contraindication", "Other"])
+            severity = st.selectbox("Severity", ["Critical", "High", "Medium", "Low"])
 
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    execution_log.append(f"Tool: {block.name}")
-                    result = process_tool(block.name, block.input, drug_mgr, notif_service,
-                                          all_reports, all_pharmacy_ids)
-                    execution_log.append(f"Result: {result[:150]}")
-                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            break
-    return "Agent completed", execution_log, receipt_mgr.get_acknowledgment_status(report_id)
+        with col2:
+            manufacturer = st.text_input("Manufacturer", placeholder="e.g., Pharma Corp")
+            affected_batches = st.text_area("Affected Batches (one per line)")
 
-def main():
-    st.set_page_config(page_title="Pharmacy Alert System", layout="wide")
-    st.title("Drug Alert System - Control Center")
-    if 'receipt_mgr' not in st.session_state:
-        st.session_state.receipt_mgr = DeliveryReceiptManager(acknowledgment_timeout_hours=24)
-    if 'alert_sent' not in st.session_state:
-        st.session_state.alert_sent = False
-    if 'custom_reports' not in st.session_state:
-        st.session_state.custom_reports = []
-    if 'custom_pharmacies' not in st.session_state:
-        st.session_state.custom_pharmacies = []
-    drug_mgr = DrugReportManager()
-    reports = drug_mgr.get_drug_reports() + st.session_state.custom_reports
-    all_pharmacies = drug_mgr.get_all_pharmacies() + st.session_state.custom_pharmacies
-    seen_ids = set()
-    pharmacies = []
-    for p in all_pharmacies:
-        if p["id"] not in seen_ids:
-            seen_ids.add(p["id"])
-            pharmacies.append(p)
-    all_pharmacy_ids = [p["id"] for p in pharmacies]
-    with st.sidebar:
-        st.header("Drug Reports")
-        tab1, tab2, tab3, tab4 = st.tabs(["View", "Create", "Pharmacy", "Stats"])
-        with tab1:
-            selected_report_id = st.selectbox(
-                "Choose Report", options=[r["id"] for r in reports],
-                format_func=lambda x: f"{next(r['drug_name'] for r in reports if r['id'] == x)}")
-        with tab2:
-            with st.form("new_report"):
-                drug_name = st.text_input("Drug Name")
-                batch_number = st.text_input("Batch Number")
-                severity = st.selectbox("Severity", ["critical", "warning", "info"])
-                issue = st.text_area("Issue", height=80)
-                action_required = st.text_area("Action Required", height=60)
-                affect_all = st.checkbox("All Pharmacies")
-                affected = [] if affect_all else st.multiselect(
-                    "Select Pharmacies", [p["id"] for p in pharmacies],
-                    format_func=lambda x: next((p['name'] for p in pharmacies if p['id'] == x), x))
-                if st.form_submit_button("Create"):
-                    if drug_name and batch_number and issue:
-                        new_id = f"drug_report_{int(time.time())}"
-                        st.session_state.custom_reports.append({
-                            "id": new_id, "drug_name": drug_name, "batch_number": batch_number,
-                            "severity": severity, "issue": issue, "action_required": action_required,
-                            "affected_pharmacies": ["all"] if affect_all else affected,
-                            "timestamp": datetime.now().isoformat()
-                        })
-                        st.success(f"Created: {drug_name}")
-                        st.rerun()
-                    else:
-                        st.error("Fill required fields")
-        with tab3:
-            with st.form("new_pharmacy"):
+        description = st.text_area("Description", height=150)
+        action_required = st.text_area("Action Required", height=100)
+
+        submitted = st.form_submit_button("Create Report", use_container_width=True)
+
+        if submitted:
+            if not drug_name or not description or not action_required:
+                st.error("Please fill in all required fields")
+            else:
+                report = {
+                    'id': generate_id('DRUG'),
+                    'drug_name': drug_name,
+                    'alert_type': alert_type,
+                    'severity': severity,
+                    'description': description,
+                    'action_required': action_required,
+                    'created_at': datetime.now().isoformat(),
+                    'created_by': 'System User',
+                    'manufacturer': manufacturer,
+                    'affected_batches': affected_batches.split('\n') if affected_batches else []
+                }
+
+                st.session_state.drug_reports.append(report)
+                st.success(f"Drug report created: {report['id']}")
+                st.json(report)
+
+# Manage Pharmacies Page
+elif page == "Manage Pharmacies":
+    st.header("Manage Pharmacies")
+
+    tab1, tab2 = st.tabs(["Add Pharmacy", "View Pharmacies"])
+
+    with tab1:
+        with st.form("pharmacy_form"):
+            col1, col2 = st.columns(2)
+
+            with col1:
                 name = st.text_input("Pharmacy Name")
                 email = st.text_input("Email")
-                if st.form_submit_button("Add"):
-                    if name and email:
-                        new_id = f"pharmacy_{int(time.time())}"
-                        st.session_state.custom_pharmacies.append({"id": new_id, "name": name, "email": email})
-                        st.success(f"Added: {name}")
-                        st.rerun()
-                    else:
-                        st.error("Fill required fields")
-        with tab4:
-            stats = st.session_state.receipt_mgr.get_statistics()
-            st.metric("Total Reports", stats["total_reports"])
-            st.metric("Total Sent", stats["total_sent"])
-            st.metric("Acknowledged", f"{stats['total_acknowledged']} ({stats['overall_rate']:.0%})")
-            st.metric("Pending", stats["total_pending"])
-            st.metric("Failed", stats["total_failed"])
-    selected_report = next((r for r in reports if r["id"] == selected_report_id), None)
-    if not selected_report:
-        st.error("Report not found")
-        return
-    col1, col2 = st.columns([1.2, 1])
-    with col1:
-        st.subheader("Report Details")
-        st.markdown(f"{selected_report['severity'].upper()}: {selected_report['drug_name']}")
-        st.markdown(f"Batch: `{selected_report['batch_number']}`")
-        st.markdown(f"**Issue:** {selected_report['issue']}")
-        st.markdown(f"**Action:** {selected_report['action_required']}")
-        if selected_report['affected_pharmacies'] == ["all"]:
-            st.info("Recommended: Broadcast to ALL")
-        else:
-            st.info(f"Recommended: {', '.join(selected_report['affected_pharmacies'])}")
-    with col2:
-        st.subheader("Alert Configuration")
-        alert_type = st.radio("Alert Type", ["broadcast", "targeted"],
-                              format_func=lambda x: "Broadcast ALL" if x == "broadcast" else "Targeted",
-                              horizontal=True)
-        selected_pharmacies = []
-        if alert_type == "targeted":
-            for p in pharmacies:
-                recommended = p["id"] in selected_report.get('affected_pharmacies', [])
-                label = f"{p['name']}" + (" (Recommended)" if recommended else "")
-                if st.checkbox(label, value=recommended, key=f"select_{p['id']}"):
-                    selected_pharmacies.append(p["id"])
-            if not selected_pharmacies:
-                st.warning("Select at least one pharmacy")
-        else:
-            selected_pharmacies = all_pharmacy_ids
-        can_send = alert_type == "broadcast" or selected_pharmacies
-        if st.button("Send Alert", type="primary", disabled=not can_send, use_container_width=True):
-            with st.spinner("Sending..."):
-                confirmation, log, delivery_status = run_agent(
-                    selected_report_id, alert_type, selected_pharmacies,
-                    reports, st.session_state.receipt_mgr, all_pharmacy_ids)
-                st.session_state.alert_sent = True
-                st.session_state.confirmation = confirmation
-                st.session_state.execution_log = log
-                st.session_state.delivery_status = delivery_status
-                st.session_state.last_report_id = selected_report_id
-    if st.session_state.alert_sent:
-        st.divider()
-        st.subheader("Alert Results")
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            st.success("Alert sent!")
-            st.markdown(st.session_state.confirmation)
-            with st.expander("Execution Log"):
-                for entry in st.session_state.execution_log:
-                    st.code(entry)
-        with col2:
-            status = st.session_state.delivery_status
-            st.metric("Sent", status['total_sent'])
-            st.metric("Acknowledged", status['acknowledged_count'])
-            st.metric("Pending", status['pending_count'])
-            if status['failed_count']:
-                st.metric("Failed", status['failed_count'])
-        with col3:
-            st.markdown("**Pending Acknowledgments:**")
-            report_id = st.session_state.last_report_id
-            for pid in status.get('pending', []):
-                pharmacy_name = next((p['name'] for p in pharmacies if p['id'] == pid), pid)
-                col_a, col_b = st.columns([3, 1])
-                with col_a:
-                    st.text(pharmacy_name)
-                with col_b:
-                    if st.button("Acknowledge", key=f"ack_{pid}", help=f"Acknowledge {pharmacy_name}"):
-                        st.session_state.receipt_mgr.mark_acknowledged(report_id, pid)
-                        st.session_state.delivery_status = st.session_state.receipt_mgr.get_acknowledgment_status(report_id)
-                        st.rerun()
-            st.divider()
-            if st.button("Send Another Alert", use_container_width=True):
-                st.session_state.alert_sent = False
-                st.rerun()
+                phone = st.text_input("Phone")
 
-if __name__ == "__main__":
-    main()
+            with col2:
+                location = st.text_input("Location")
+                pharmacy_type = st.selectbox("Type", ["Independent", "Chain", "Hospital"])
+                region = st.text_input("Region")
+
+            submitted = st.form_submit_button("Add Pharmacy", use_container_width=True)
+
+            if submitted:
+                if not all([name, email, phone, location, region]):
+                    st.error("Please fill in all required fields")
+                elif not validate_email(email):
+                    st.error("Invalid email format")
+                elif not validate_phone(phone):
+                    st.error("Invalid phone format")
+                else:
+                    pharmacy = {
+                        'id': generate_id('PHARM'),
+                        'name': name,
+                        'email': email,
+                        'phone': phone,
+                        'location': location,
+                        'pharmacy_type': pharmacy_type,
+                        'region': region,
+                        'created_at': datetime.now().isoformat()
+                    }
+
+                    st.session_state.pharmacies.append(pharmacy)
+                    st.success(f"Pharmacy added: {pharmacy['id']}")
+
+    with tab2:
+        st.subheader("All Pharmacies")
+        if st.session_state.pharmacies:
+            st.dataframe(st.session_state.pharmacies, use_container_width=True)
+            st.write(f"Total: {len(st.session_state.pharmacies)} pharmacies")
+        else:
+            st.info("No pharmacies added yet")
+
+# Send Alerts Page
+elif page == "Send Alerts":
+    st.header("Send Alerts")
+
+    if not st.session_state.pharmacies:
+        st.warning("Please add pharmacies first")
+    elif not st.session_state.drug_reports:
+        st.warning("Please create a drug report first")
+    else:
+        alert_type = st.radio("Alert Type", ["Broadcast", "Targeted"])
+
+        drug_report_idx = st.selectbox(
+            "Select Drug Report",
+            range(len(st.session_state.drug_reports)),
+            format_func=lambda
+                i: f"{st.session_state.drug_reports[i]['drug_name']} ({st.session_state.drug_reports[i]['severity']})"
+        )
+
+        drug_report = st.session_state.drug_reports[drug_report_idx]
+
+        if alert_type == "Broadcast":
+            st.info(f"This alert will be sent to all {len(st.session_state.pharmacies)} pharmacies")
+            if st.button("Send Broadcast Alert", use_container_width=True):
+                with st.spinner("Sending alerts..."):
+                    results = st.session_state.broadcast_agent.send_alert(
+                        drug_report,
+                        st.session_state.pharmacies
+                    )
+
+                    st.session_state.delivery_receipts.extend(results['deliveries'])
+
+                    st.success("Broadcast alerts sent!")
+                    st.json(create_alert_summary(drug_report, results))
+
+        else:  # Targeted
+            col1, col2 = st.columns(2)
+
+            available_regions = list(set([p['region'] for p in st.session_state.pharmacies]))
+            available_types = list(set([p['pharmacy_type'] for p in st.session_state.pharmacies]))
+
+            with col1:
+                target_region = st.multiselect(
+                    "Target Regions",
+                    available_regions,
+                    default=available_regions[:1] if available_regions else []
+                )
+
+            with col2:
+                target_type = st.multiselect(
+                    "Target Pharmacy Types",
+                    available_types,
+                    default=available_types[:1] if available_types else []
+                )
+
+            matching_count = len([p for p in st.session_state.pharmacies
+                                  if (not target_region or p['region'] in target_region) and
+                                  (not target_type or p['pharmacy_type'] in target_type)])
+
+            st.info(f"This alert will be sent to {matching_count} matching pharmacies")
+
+            if st.button("Send Targeted Alert", use_container_width=True):
+                criteria = {}
+                if target_region:
+                    criteria['regions_affected'] = target_region
+                if target_type:
+                    criteria['pharmacy_type'] = target_type
+
+                with st.spinner("Sending targeted alerts..."):
+                    results = st.session_state.targeted_agent.send_alert(
+                        drug_report,
+                        st.session_state.pharmacies,
+                        criteria
+                    )
+
+                    st.session_state.delivery_receipts.extend(results['deliveries'])
+
+                    st.success("Targeted alerts sent!")
+                    st.json(create_alert_summary(drug_report, results))
+
+# Track Deliveries Page
+elif page == "Track Deliveries":
+    st.header("Track Deliveries")
+
+    if st.session_state.delivery_receipts:
+        # Convert to list of dicts for display
+        receipts_list = []
+        for delivery in st.session_state.delivery_receipts:
+            if isinstance(delivery, dict):
+                receipts_list.append(delivery)
+
+        st.dataframe(receipts_list, use_container_width=True)
+
+        st.divider()
+
+        # Filter by status
+        status_filter = st.selectbox("Filter by Status", ["All", "Sent", "Acknowledged", "Failed"])
+
+        if status_filter != "All":
+            filtered = [r for r in receipts_list if r.get('status') == status_filter.lower()]
+            st.dataframe(filtered, use_container_width=True)
+            st.write(f"Found {len(filtered)} deliveries with status: {status_filter}")
+    else:
+        st.info("No deliveries to track. Send an alert to get started!")
+
+# Statistics Page
+elif page == "Statistics":
+    st.header("Statistics")
+
+    if st.session_state.delivery_receipts:
+        receipts_list = [d for d in st.session_state.delivery_receipts if isinstance(d, dict)]
+        stats = calculate_acknowledgment_rate(receipts_list)
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("Total Deliveries", stats['total_receipts'])
+
+        with col2:
+            st.metric("Acknowledged", f"{stats['acknowledgment_rate']:.1f}%")
+
+        with col3:
+            st.metric("Pending", f"{stats['pending_rate']:.1f}%")
+
+        with col4:
+            st.metric("Failed", f"{stats['failure_rate']:.1f}%")
+
+        st.divider()
+
+        # Pie chart
+        col1, col2 = st.columns(2)
+
+        with col1:
+            import plotly.graph_objects as go
+
+            fig = go.Figure(data=[go.Pie(
+                labels=['Acknowledged', 'Pending', 'Failed'],
+                values=[
+                    stats['acknowledged'],
+                    stats['pending'],
+                    stats['failed']
+                ],
+                marker=dict(colors=['#00CC00', '#FFCC00', '#FF0000'])
+            )])
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.subheader("Detailed Stats")
+            for key, value in stats.items():
+                if isinstance(value, float):
+                    st.write(f"{key}: {value:.2f}{'%' if 'rate' in key else ''}")
+                else:
+                    st.write(f"{key}: {value}")
+    else:
+        st.info("No delivery data available yet. Send some alerts to see statistics!")
+
+# Footer
+st.divider()
+st.markdown("""
+---
+**Drug Reporter** © 2024 | Multi-Agent Healthcare Safety System
+""")
