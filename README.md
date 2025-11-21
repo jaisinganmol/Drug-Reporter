@@ -151,4 +151,4 @@ User Input (Natural Language)
 
 ## License
 
-MIT
+MIT Open Source License
